@@ -25,6 +25,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -33,6 +34,11 @@ constexpr uint8_t TEST_PATTERN = 0xA5U;
 constexpr size_t MIB = 1024U * 1024U;
 constexpr size_t GIB = 1024U * MIB;
 constexpr size_t MAX_BATCH_COUNT = 4096U;
+constexpr size_t KV_LAYER_COUNT = 61U;
+constexpr size_t KV_K_BYTES = 128U * 1024U;
+constexpr size_t KV_V_BYTES = 16U * 1024U;
+constexpr size_t KV_DESCRIPTORS_PER_KEY = KV_LAYER_COUNT * 2U;
+constexpr size_t KV_BYTES_PER_KEY = KV_LAYER_COUNT * (KV_K_BYTES + KV_V_BYTES);
 constexpr int MAP_HUGE_SHIFT_VALUE = 26;
 constexpr int MAP_HUGE_2M_FLAG = 21 << MAP_HUGE_SHIFT_VALUE;
 constexpr int MAP_HUGE_1G_FLAG = 30 << MAP_HUGE_SHIFT_VALUE;
@@ -57,6 +63,7 @@ struct Options {
     int32_t deviceId = 0;
     size_t totalBytes = 256U * MIB;
     size_t batchCount = 16U;
+    size_t dataDim = 1U;
     size_t warmup = 5U;
     size_t iterations = 20U;
     MemorySelection memorySelection = MemorySelection::ALL;
@@ -66,8 +73,10 @@ void PrintUsage(const char *program)
 {
     std::cout << "Usage: " << program << " [options]\n"
               << "  --device ID       logic device ID (default: 0)\n"
-              << "  --size-mb MB      total bytes per batch call (default: 256)\n"
-              << "  --batch-count N   number of entries in one batch (default: 16)\n"
+              << "  --data-dim N      1 for equal-size entries, 2 for MemCache KV layout (default: 1)\n"
+              << "  --size-mb MB      data-dim=1 total bytes per batch call (default: 256)\n"
+              << "  --batch-count N   data-dim=1 entry count; data-dim=2 key batch size (default: 16)\n"
+              << "  --batch-size N    alias of --batch-count\n"
               << "  --warmup N        warmup calls (default: 5)\n"
               << "  --iterations N    measured calls (default: 20)\n"
               << "  --memory MODE     mmap-4k, mmap-2m, mmap-1g, hal-normal, hal-huge, mmap-all, or all\n"
@@ -155,8 +164,11 @@ bool ParseOption(int argc, char *argv[], int &index, Options &options)
         options.totalBytes = parsed * MIB;
         return true;
     }
-    if (arg == "--batch-count") {
+    if (arg == "--batch-count" || arg == "--batch-size") {
         return ParseUnsigned(value, options.batchCount);
+    }
+    if (arg == "--data-dim") {
+        return ParseUnsigned(value, options.dataDim);
     }
     if (arg == "--warmup") {
         return ParseUnsigned(value, options.warmup);
@@ -171,20 +183,27 @@ bool ParseOption(int argc, char *argv[], int &index, Options &options)
     return false;
 }
 
-bool ParseOptions(int argc, char *argv[], Options &options)
+bool FinalizeOptions(Options &options)
 {
-    for (int index = 1; index < argc; ++index) {
-        if (!ParseOption(argc, argv, index, options)) {
-            return false;
-        }
-    }
-    if (options.totalBytes == 0U || options.batchCount == 0U || options.iterations == 0U) {
-        std::cerr << "[ERROR] size, batch-count, and iterations must be greater than zero\n";
+    if (options.dataDim != 1U && options.dataDim != 2U) {
+        std::cerr << "[ERROR] data-dim must be 1 or 2, dataDim=" << options.dataDim << '\n';
         return false;
     }
-    if (options.batchCount > MAX_BATCH_COUNT) {
-        std::cerr << "[ERROR] batch-count exceeds halMemcpyBatch limit, batchCount=" << options.batchCount
-                  << ", max=" << MAX_BATCH_COUNT << '\n';
+    if (options.batchCount == 0U || options.iterations == 0U) {
+        std::cerr << "[ERROR] batch-count and iterations must be greater than zero\n";
+        return false;
+    }
+    if (options.dataDim == 2U) {
+        if (options.batchCount > std::numeric_limits<size_t>::max() / KV_BYTES_PER_KEY) {
+            std::cerr << "[ERROR] KV workload size overflow, batchCount=" << options.batchCount << '\n';
+            return false;
+        }
+        options.totalBytes = options.batchCount * KV_BYTES_PER_KEY;
+        return true;
+    }
+    if (options.totalBytes == 0U || options.batchCount > MAX_BATCH_COUNT) {
+        std::cerr << "[ERROR] invalid data-dim=1 size or batch count, totalBytes=" << options.totalBytes
+                  << ", batchCount=" << options.batchCount << ", maxBatchCount=" << MAX_BATCH_COUNT << '\n';
         return false;
     }
     if (options.totalBytes % options.batchCount != 0U) {
@@ -193,6 +212,16 @@ bool ParseOptions(int argc, char *argv[], Options &options)
         return false;
     }
     return true;
+}
+
+bool ParseOptions(int argc, char *argv[], Options &options)
+{
+    for (int index = 1; index < argc; ++index) {
+        if (!ParseOption(argc, argv, index, options)) {
+            return false;
+        }
+    }
+    return FinalizeOptions(options);
 }
 
 class HalApi {
@@ -296,14 +325,25 @@ private:
 
 class DeviceBuffer {
 public:
-    bool Allocate(size_t size)
+    bool Allocate(size_t size, size_t alignment = 1U)
     {
-        size_ = size;
-        const aclError ret = aclrtMalloc(&address_, size, ACL_MEM_MALLOC_HUGE_FIRST);
-        if (ret != ACL_SUCCESS || address_ == nullptr) {
-            std::cerr << "[ERROR] aclrtMalloc failed, size=" << size << ", ret=" << ret << '\n';
+        if (alignment == 0U || (alignment & (alignment - 1U)) != 0U ||
+            size > std::numeric_limits<size_t>::max() - (alignment - 1U)) {
+            std::cerr << "[ERROR] invalid device allocation alignment or size, size=" << size
+                      << ", alignment=" << alignment << '\n';
             return false;
         }
+        size_ = size;
+        allocationSize_ = size + alignment - 1U;
+        const aclError ret = aclrtMalloc(&allocationAddress_, allocationSize_, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (ret != ACL_SUCCESS || allocationAddress_ == nullptr) {
+            std::cerr << "[ERROR] aclrtMalloc failed, size=" << allocationSize_ << ", alignment=" << alignment
+                      << ", ret=" << ret << '\n';
+            return false;
+        }
+        const uintptr_t rawAddress = reinterpret_cast<uintptr_t>(allocationAddress_);
+        const uintptr_t alignedAddress = (rawAddress + alignment - 1U) & ~(alignment - 1U);
+        address_ = reinterpret_cast<void *>(alignedAddress);
         const aclError memsetRet = aclrtMemset(address_, size_, TEST_PATTERN, size_);
         if (memsetRet != ACL_SUCCESS) {
             std::cerr << "[ERROR] aclrtMemset failed, address=" << address_ << ", size=" << size_
@@ -315,10 +355,11 @@ public:
 
     ~DeviceBuffer()
     {
-        if (address_ != nullptr) {
-            const aclError ret = aclrtFree(address_);
+        if (allocationAddress_ != nullptr) {
+            const aclError ret = aclrtFree(allocationAddress_);
             if (ret != ACL_SUCCESS) {
-                std::cerr << "[ERROR] aclrtFree failed, address=" << address_ << ", ret=" << ret << '\n';
+                std::cerr << "[ERROR] aclrtFree failed, allocationAddress=" << allocationAddress_
+                          << ", alignedAddress=" << address_ << ", ret=" << ret << '\n';
             }
         }
     }
@@ -329,8 +370,45 @@ public:
     }
 
 private:
+    void *allocationAddress_ = nullptr;
     void *address_ = nullptr;
     size_t size_ = 0U;
+    size_t allocationSize_ = 0U;
+};
+
+class SourceBuffers {
+public:
+    bool Allocate(const Options &options)
+    {
+        if (options.dataDim == 1U) {
+            return primary_.Allocate(options.totalBytes);
+        }
+        const size_t kBytes = options.batchCount * KV_LAYER_COUNT * KV_K_BYTES;
+        const size_t vBytes = options.batchCount * KV_LAYER_COUNT * KV_V_BYTES;
+        if (!primary_.Allocate(kBytes, 2U * MIB)) {
+            std::cerr << "[ERROR] KV K source allocation failed, size=" << kBytes << '\n';
+            return false;
+        }
+        if (!secondary_.Allocate(vBytes, 2U * MIB)) {
+            std::cerr << "[ERROR] KV V source allocation failed, size=" << vBytes << '\n';
+            return false;
+        }
+        return true;
+    }
+
+    uint64_t PrimaryAddress() const
+    {
+        return primary_.Address();
+    }
+
+    uint64_t SecondaryAddress() const
+    {
+        return secondary_.Address();
+    }
+
+private:
+    DeviceBuffer primary_;
+    DeviceBuffer secondary_;
 };
 
 const char *MemoryKindName(MemoryKind kind)
@@ -503,7 +581,9 @@ struct BatchArguments {
     std::vector<size_t> size;
 };
 
-BatchArguments MakeBatchArguments(uint64_t dstBase, uint64_t srcBase, size_t totalBytes, size_t count)
+using BatchWorkload = std::vector<BatchArguments>;
+
+BatchWorkload MakeOneDimensionalWorkload(uint64_t dstBase, uint64_t srcBase, size_t totalBytes, size_t count)
 {
     BatchArguments args{std::vector<uint64_t>(count), std::vector<uint64_t>(count), std::vector<size_t>(count)};
     const size_t bytesPerEntry = totalBytes / count;
@@ -513,20 +593,74 @@ BatchArguments MakeBatchArguments(uint64_t dstBase, uint64_t srcBase, size_t tot
         args.src[index] = srcBase + offset;
         args.size[index] = bytesPerEntry;
     }
+    BatchWorkload workload;
+    workload.emplace_back(std::move(args));
+    return workload;
+}
+
+BatchArguments MakeKvKeyArguments(uint64_t dstBase, uint64_t kBase, uint64_t vBase, size_t batchSize,
+                                  size_t keyIndex)
+{
+    BatchArguments args;
+    args.dst.reserve(KV_DESCRIPTORS_PER_KEY);
+    args.src.reserve(KV_DESCRIPTORS_PER_KEY);
+    args.size.reserve(KV_DESCRIPTORS_PER_KEY);
+    size_t dstOffset = keyIndex * KV_BYTES_PER_KEY;
+    for (size_t layer = 0; layer < KV_LAYER_COUNT; ++layer) {
+        const size_t blockIndex = layer * batchSize + keyIndex;
+        args.dst.push_back(dstBase + dstOffset);
+        args.src.push_back(kBase + blockIndex * KV_K_BYTES);
+        args.size.push_back(KV_K_BYTES);
+        dstOffset += KV_K_BYTES;
+        args.dst.push_back(dstBase + dstOffset);
+        args.src.push_back(vBase + blockIndex * KV_V_BYTES);
+        args.size.push_back(KV_V_BYTES);
+        dstOffset += KV_V_BYTES;
+    }
     return args;
 }
 
-bool RunCopies(HalApi &hal, BatchArguments &args, size_t count, size_t iterations,
-               std::vector<double> &latenciesMs)
+BatchWorkload MakeKvWorkload(uint64_t dstBase, uint64_t kBase, uint64_t vBase, size_t batchSize)
+{
+    BatchWorkload workload;
+    workload.reserve(batchSize);
+    for (size_t keyIndex = 0; keyIndex < batchSize; ++keyIndex) {
+        workload.emplace_back(MakeKvKeyArguments(dstBase, kBase, vBase, batchSize, keyIndex));
+    }
+    return workload;
+}
+
+BatchWorkload MakeWorkload(const Options &options, uint64_t dstBase, const SourceBuffers &source)
+{
+    if (options.dataDim == 2U) {
+        return MakeKvWorkload(dstBase, source.PrimaryAddress(), source.SecondaryAddress(), options.batchCount);
+    }
+    return MakeOneDimensionalWorkload(dstBase, source.PrimaryAddress(), options.totalBytes, options.batchCount);
+}
+
+bool RunWorkloadOnce(HalApi &hal, BatchWorkload &workload, size_t iteration)
+{
+    for (size_t callIndex = 0; callIndex < workload.size(); ++callIndex) {
+        auto &args = workload[callIndex];
+        const size_t count = args.size.size();
+        const DVresult ret = hal.memcpyBatch_(args.dst.data(), args.src.data(), args.size.data(), count);
+        if (ret != 0) {
+            std::cerr << "[ERROR] halMemcpyBatch failed, iteration=" << iteration << ", callIndex=" << callIndex
+                      << ", count=" << count << ", ret=" << ret << '\n';
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RunCopies(HalApi &hal, BatchWorkload &workload, size_t iterations, std::vector<double> &latenciesMs)
 {
     latenciesMs.reserve(iterations);
     for (size_t index = 0; index < iterations; ++index) {
         const auto begin = std::chrono::steady_clock::now();
-        const DVresult ret = hal.memcpyBatch_(args.dst.data(), args.src.data(), args.size.data(), count);
+        const bool success = RunWorkloadOnce(hal, workload, index);
         const auto end = std::chrono::steady_clock::now();
-        if (ret != 0) {
-            std::cerr << "[ERROR] halMemcpyBatch failed, iteration=" << index << ", count=" << count
-                      << ", ret=" << ret << '\n';
+        if (!success) {
             return false;
         }
         latenciesMs.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
@@ -554,31 +688,47 @@ double Percentile(std::vector<double> values, double ratio)
     return values[index];
 }
 
+size_t CountDescriptors(const BatchWorkload &workload)
+{
+    return std::accumulate(workload.begin(), workload.end(), size_t{0},
+                           [](size_t total, const BatchArguments &args) { return total + args.size.size(); });
+}
+
 void PrintExperimentHeader(const char *memoryName, const Options &options)
 {
     constexpr const char *separator = "================================================================";
+    const double copyMib = static_cast<double>(options.totalBytes) / static_cast<double>(MIB);
     std::cout << '\n' << separator << '\n'
-              << "[EXPERIMENT] memory=" << memoryName << " batchCount=" << options.batchCount
-              << " copyMiB=" << options.totalBytes / MIB << '\n'
+              << std::fixed << std::setprecision(3) << "[EXPERIMENT] memory=" << memoryName
+              << " dataDim=" << options.dataDim << " batchSize=" << options.batchCount << " copyMiB=" << copyMib
+              << '\n'
               << separator << '\n';
 }
 
 void PrintResult(const char *memoryName, const Options &options, size_t allocationSize,
-                 const std::vector<double> &latenciesMs)
+                 const BatchWorkload &workload, const std::vector<double> &latenciesMs)
 {
     const double totalMs = std::accumulate(latenciesMs.begin(), latenciesMs.end(), 0.0);
     const double averageMs = totalMs / static_cast<double>(latenciesMs.size());
     const double gib = static_cast<double>(options.totalBytes) / static_cast<double>(1ULL << 30U);
     const double gibPerSecond = gib / (averageMs / 1000.0);
+    const double copyMib = static_cast<double>(options.totalBytes) / static_cast<double>(MIB);
+    const double allocatedMib = static_cast<double>(allocationSize) / static_cast<double>(MIB);
     std::cout << std::fixed << std::setprecision(3) << "[RESULT] memory=" << memoryName
-              << " copyMiB=" << options.totalBytes / MIB << " allocatedMiB=" << allocationSize / MIB
-              << " batchCount=" << options.batchCount
-              << " bytesPerEntry=" << options.totalBytes / options.batchCount << " avgMs=" << averageMs
-              << " p50Ms=" << Percentile(latenciesMs, 0.50) << " p95Ms=" << Percentile(latenciesMs, 0.95)
-              << " bandwidthGiB/s=" << gibPerSecond << '\n';
+              << " dataDim=" << options.dataDim << " copyMiB=" << copyMib << " allocatedMiB=" << allocatedMib
+              << " batchSize=" << options.batchCount << " halCalls=" << workload.size()
+              << " descriptors=" << CountDescriptors(workload);
+    if (options.dataDim == 1U) {
+        std::cout << " bytesPerEntry=" << options.totalBytes / options.batchCount;
+    } else {
+        std::cout << " descriptorsPerCall=" << KV_DESCRIPTORS_PER_KEY << " kBytes=" << KV_K_BYTES
+                  << " vBytes=" << KV_V_BYTES;
+    }
+    std::cout << " avgMs=" << averageMs << " p50Ms=" << Percentile(latenciesMs, 0.50)
+              << " p95Ms=" << Percentile(latenciesMs, 0.95) << " bandwidthGiB/s=" << gibPerSecond << '\n';
 }
 
-TestResult RunMemoryTest(MemoryKind kind, const Options &options, HalApi &hal, const DeviceBuffer &source)
+TestResult RunMemoryTest(MemoryKind kind, const Options &options, HalApi &hal, const SourceBuffers &source)
 {
     const char *memoryName = MemoryKindName(kind);
     PrintExperimentHeader(memoryName, options);
@@ -594,17 +744,20 @@ TestResult RunMemoryTest(MemoryKind kind, const Options &options, HalApi &hal, c
     }
     std::cout << "[INFO] memory=" << memoryName << " allocatedBytes=" << destination.AllocationSize()
               << " hostVa=" << static_cast<const void *>(destination.HostAddress()) << " dstDva=0x" << std::hex
-              << destination.DeviceAddress() << " srcDva=0x" << source.Address() << std::dec << '\n';
+              << destination.DeviceAddress() << " primarySrcDva=0x" << source.PrimaryAddress();
+    if (options.dataDim == 2U) {
+        std::cout << " secondarySrcDva=0x" << source.SecondaryAddress();
+    }
+    std::cout << std::dec << '\n';
     const uint64_t hostDestination = reinterpret_cast<uint64_t>(destination.HostAddress());
-    BatchArguments args =
-        MakeBatchArguments(hostDestination, source.Address(), options.totalBytes, options.batchCount);
+    BatchWorkload workload = MakeWorkload(options, hostDestination, source);
     std::vector<double> ignored;
-    if (!RunCopies(hal, args, options.batchCount, options.warmup, ignored)) {
+    if (!RunCopies(hal, workload, options.warmup, ignored)) {
         std::cerr << "[ERROR] warmup failed, memory=" << memoryName << '\n';
         return TestResult::FAILURE;
     }
     std::vector<double> latenciesMs;
-    if (!RunCopies(hal, args, options.batchCount, options.iterations, latenciesMs)) {
+    if (!RunCopies(hal, workload, options.iterations, latenciesMs)) {
         std::cerr << "[ERROR] measured copy failed, memory=" << memoryName << '\n';
         return TestResult::FAILURE;
     }
@@ -612,7 +765,7 @@ TestResult RunMemoryTest(MemoryKind kind, const Options &options, HalApi &hal, c
         std::cerr << "[ERROR] data verification failed, memory=" << memoryName << '\n';
         return TestResult::FAILURE;
     }
-    PrintResult(memoryName, options, destination.AllocationSize(), latenciesMs);
+    PrintResult(memoryName, options, destination.AllocationSize(), workload, latenciesMs);
     return TestResult::SUCCESS;
 }
 
@@ -654,8 +807,8 @@ int Run(const Options &options)
         std::cerr << "[ERROR] HAL API initialization failed\n";
         return EXIT_FAILURE;
     }
-    DeviceBuffer source;
-    if (!source.Allocate(options.totalBytes)) {
+    SourceBuffers source;
+    if (!source.Allocate(options)) {
         std::cerr << "[ERROR] source device allocation failed, size=" << options.totalBytes << '\n';
         return EXIT_FAILURE;
     }
