@@ -37,13 +37,14 @@ bash run.sh --data-dim 2 --batch-size 32 --warmup 5 --iterations 20 --memory all
 
 `main.cpp`、`CMakeLists.txt` 和 `run.sh` 就在独立仓库根目录，不需要进入 `examples/...` 子目录。
 
-默认参数是 device 0、总传输量 256 MiB、每批 16 段、预热 5 次、计时 20 次，并依次尝试以下后端：
+默认参数是 device 0、总传输量 256 MiB、每批 16 段、预热 5 次、计时 20 次。使用 `--memory all`
+时会依次尝试以下后端：
 
+- `hal-normal`：`MEM_HOST | MEM_TYPE_DDR | MEM_PAGE_NORMAL`
+- `hal-huge`：`MEM_HOST | MEM_TYPE_DDR | MEM_PAGE_HUGE`
 - `mmap-4k`：普通匿名 mmap，并通过 `MADV_NOHUGEPAGE` 禁止 THP 合并
 - `mmap-2m`：`MAP_HUGETLB | MAP_HUGE_2MB`
 - `mmap-1g`：`MAP_HUGETLB | MAP_HUGE_1GB`
-- `hal-normal`：`MEM_HOST | MEM_TYPE_DDR | MEM_PAGE_NORMAL`
-- `hal-huge`：`MEM_HOST | MEM_TYPE_DDR | MEM_PAGE_HUGE`
 
 系统不支持或没有预留对应 HugeTLB 页时会显示 `SKIPPED`，其他后端继续运行：
 

@@ -775,8 +775,8 @@ std::vector<MemoryKind> SelectedMemoryKinds(MemorySelection selection)
         return {MemoryKind::MMAP_4K, MemoryKind::MMAP_2M, MemoryKind::MMAP_1G};
     }
     if (selection == MemorySelection::ALL) {
-        return {MemoryKind::MMAP_4K, MemoryKind::MMAP_2M, MemoryKind::MMAP_1G, MemoryKind::HAL_NORMAL,
-                MemoryKind::HAL_HUGE};
+        return {MemoryKind::HAL_NORMAL, MemoryKind::HAL_HUGE, MemoryKind::MMAP_4K, MemoryKind::MMAP_2M,
+                MemoryKind::MMAP_1G};
     }
     switch (selection) {
         case MemorySelection::MMAP_4K:
