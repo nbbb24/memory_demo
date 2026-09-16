@@ -39,6 +39,20 @@ bash run.sh
 bash run.sh --device 0 --size-mb 256 --batch-count 16 --warmup 5 --iterations 20 --memory all
 ```
 
+复现 MemCache benchmark 的 `data_dim=2、batch_size=32`：
+
+```bash
+bash run.sh --data-dim 2 --batch-size 32 --warmup 5 --iterations 20 --memory all
+```
+
+`data-dim=2` 固定使用与 MemCache `example/benchmark/mutil_process.py` 相同的 KV 布局：61 层，每层 K 为
+128 KiB、V 为 16 KiB。此时 `--batch-size`（或 `--batch-count`）表示 key batch size，`--size-mb`
+不参与数据量计算。batch size 32 时每次迭代共复制 274.5 MiB，包含 3904 个 descriptor。
+
+为了复现 MemCache 默认 `aggregate.num=122` 的提交方式，demo 每个 key 发起一次
+`halMemcpyBatch(count=122)`，因此 batch size 32 的一次计时迭代包含32次 HAL 调用。源端 K、V 分别按
+`[61][batch_size][block_size]` 分配并进行2 MiB首地址对齐，目标端按每个 key 连续的 K/V 交替布局写入。
+
 也可以单独测试一个后端：
 
 ```bash
@@ -78,11 +92,12 @@ grep -i huge /proc/meminfo
 结果示例：
 
 ```text
-[RESULT] memory=mmap-2m copyMiB=256 allocatedMiB=256 batchCount=16 ... bandwidthGiB/s=...
+[RESULT] memory=mmap-2m dataDim=2 copyMiB=274.500 batchSize=32 halCalls=32 descriptors=3904 ...
 ```
 
-- `bandwidthGiB/s` 按一次 batch 的总字节数除以 `halMemcpyBatch` 调用耗时计算。
-- `halMemcpyBatch` 是同步接口，数组项数上限为 4096；demo 会在参数解析阶段检查这个限制。
+- `bandwidthGiB/s` 按一次计时迭代的总字节数除以该迭代内全部 `halMemcpyBatch` 调用总耗时计算。
+- `data-dim=1` 每次迭代只调用一次 `halMemcpyBatch`；`data-dim=2` 每个 key 调用一次。
+- `halMemcpyBatch` 是同步接口，数组项数上限为 4096；`data-dim=2` 每次调用固定为122项。
 - mmap、首次触页、`halHostRegister`、预热和结果校验均不计入带宽。
 - 如果 `mmap-4k` 明显慢于 `mmap-2m`/`mmap-1g`，优先检查生产路径是否因大页不足回退到了 4K。
 - 如果 mmap 三种页型都慢但 hal 后端快，重点检查 mmap 页池、NUMA 放置和 `halHostRegister` 路径。
