@@ -694,6 +694,17 @@ size_t CountDescriptors(const BatchWorkload &workload)
                            [](size_t total, const BatchArguments &args) { return total + args.size.size(); });
 }
 
+void PrintExperimentHeader(const char *memoryName, const Options &options)
+{
+    constexpr const char *separator = "================================================================";
+    const double copyMib = static_cast<double>(options.totalBytes) / static_cast<double>(MIB);
+    std::cout << '\n' << separator << '\n'
+              << std::fixed << std::setprecision(3) << "[EXPERIMENT] memory=" << memoryName
+              << " dataDim=" << options.dataDim << " batchSize=" << options.batchCount << " copyMiB=" << copyMib
+              << '\n'
+              << separator << '\n';
+}
+
 void PrintResult(const char *memoryName, const Options &options, size_t allocationSize,
                  const BatchWorkload &workload, const std::vector<double> &latenciesMs)
 {
@@ -720,6 +731,7 @@ void PrintResult(const char *memoryName, const Options &options, size_t allocati
 TestResult RunMemoryTest(MemoryKind kind, const Options &options, HalApi &hal, const SourceBuffers &source)
 {
     const char *memoryName = MemoryKindName(kind);
+    PrintExperimentHeader(memoryName, options);
     RegisteredHostBuffer destination;
     const SetupResult setup = destination.Allocate(options.totalBytes, kind, hal, options.deviceId);
     if (setup == SetupResult::UNAVAILABLE) {

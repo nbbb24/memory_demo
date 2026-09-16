@@ -92,6 +92,9 @@ grep -i huge /proc/meminfo
 结果示例：
 
 ```text
+================================================================
+[EXPERIMENT] memory=mmap-2m dataDim=2 batchSize=32 copyMiB=274.500
+================================================================
 [RESULT] memory=mmap-2m dataDim=2 copyMiB=274.500 batchSize=32 halCalls=32 descriptors=3904 ...
 ```
 
