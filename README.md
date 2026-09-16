@@ -17,13 +17,25 @@ aclrtMalloc(HBM) -> halMemcpyBatch -> 已通过 halHostRegister 注册的 Host D
 
 ## 一键运行
 
-先加载 CANN 环境，然后执行：
+首次使用时克隆独立仓库并进入仓库根目录：
 
 ```bash
+git clone https://github.com/nbbb24/memory_demo.git
+cd memory_demo
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-cd examples/hbm_share_memory/HalMemcpyBatchD2H
 bash run.sh
 ```
+
+如果已经克隆到 `/home/sxy/memory_demo`，更新并运行：
+
+```bash
+cd /home/sxy/memory_demo
+git pull
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+bash run.sh --data-dim 2 --batch-size 32 --warmup 5 --iterations 20 --memory all
+```
+
+`main.cpp`、`CMakeLists.txt` 和 `run.sh` 就在独立仓库根目录，不需要进入 `examples/...` 子目录。
 
 默认参数是 device 0、总传输量 256 MiB、每批 16 段、预热 5 次、计时 20 次，并依次尝试以下后端：
 
