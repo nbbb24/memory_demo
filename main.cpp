@@ -585,8 +585,9 @@ TestResult RunMemoryTest(MemoryKind kind, const Options &options, HalApi &hal, c
     std::cout << "[INFO] memory=" << memoryName << " allocatedBytes=" << destination.AllocationSize()
               << " hostVa=" << static_cast<const void *>(destination.HostAddress()) << " dstDva=0x" << std::hex
               << destination.DeviceAddress() << " srcDva=0x" << source.Address() << std::dec << '\n';
-    BatchArguments args = MakeBatchArguments(destination.DeviceAddress(), source.Address(), options.totalBytes,
-                                              options.batchCount);
+    const uint64_t hostDestination = reinterpret_cast<uint64_t>(destination.HostAddress());
+    BatchArguments args =
+        MakeBatchArguments(hostDestination, source.Address(), options.totalBytes, options.batchCount);
     std::vector<double> ignored;
     if (!RunCopies(hal, args, options.batchCount, options.warmup, ignored)) {
         std::cerr << "[ERROR] warmup failed, memory=" << memoryName << '\n';

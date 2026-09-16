@@ -3,16 +3,17 @@
 这个独立 demo 用于在相同 D2H 负载下对比多种 Host DRAM 分配方式，不需要先构建 MemFabric：
 
 ```text
-aclrtMalloc(HBM) -> halMemcpyBatch -> halHostRegister(Host DRAM) 返回的 DVA
+aclrtMalloc(HBM) -> halMemcpyBatch -> 已通过 halHostRegister 注册的 Host DRAM
 ```
 
 这是本机 HBM 到本机已注册 DRAM 的基线测试，用来隔离 mmap/页型/注册后的 D2H 性能；它不经过 URMA 网络，
 因此不能替代 device URMA 端到端测试。驱动接口还明确不支持来自 `ipc_open`/共享内存导入的 VA，demo 只使用
 本进程本地分配并注册的地址。
 
-它和 `HybmConnBasedSegment` 的 device URMA 主机内存路径保持一致：先 `mmap` 或 `halMemAlloc`，再以
-`HOST_MEM_MAP_DEV` 调用 `halHostRegister`，传给 `halMemcpyBatch` 的目标地址是注册返回的
-设备可见地址（DVA），不是原始 host VA。
+它和 `HybmConnBasedSegment` 的 device URMA 主机内存准备路径保持一致：先 `mmap` 或 `halMemAlloc`，再以
+`HOST_MEM_MAP_DEV` 调用 `halHostRegister`。`halMemcpyBatch` 是 Host 侧发起的 D2H 接口，因此 `dst[]` 使用
+原始 Host VA；注册返回的 DVA 仅用于设备/URMA 侧访问，并在日志中输出以便核对。对于部分 `halMemAlloc`
+内存，HVA 与 DVA 可能相同，但不能据此把 mmap 注册返回的 DVA 当作 batch 的 Host 目标地址。
 
 ## 一键运行
 
